@@ -246,11 +246,11 @@ fn make_gpu(world: &WorldDrawn<'_>, model: &Model) -> Gpu {
             module: &shader,
             entry_point: Some("vs"),
             compilation_options: Default::default(),
-            buffers: &[wgpu::VertexBufferLayout {
+            buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: VERTEX_STRIDE,
                 step_mode: wgpu::VertexStepMode::Vertex,
                 attributes: &attributes,
-            }],
+            })],
         },
         primitive: Default::default(),
         depth_stencil: Some(wgpu::DepthStencilState {
