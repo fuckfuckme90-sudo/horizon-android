@@ -199,6 +199,7 @@ mod native_block_entity_draw;
 mod native_components;
 mod native_criteria;
 mod native_entities;
+mod jenny;
 mod native_explosions;
 mod native_falling;
 mod native_hooks;

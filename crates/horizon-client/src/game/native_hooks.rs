@@ -1908,7 +1908,7 @@ impl Game<'_> {
     /// chat box then completes them as vanilla's, within their level. A
     /// name vanilla has is left out. API 8.
     pub(super) fn native_register_commands(&mut self, commands: &mut Vec<NativeCommand>) {
-        let _ = commands;
+        super::jenny::register(commands);
     }
     /// A player's command on the server (`Commands.performCommand`),
     /// without its slash, for a command a mod registered and the player's
@@ -1921,7 +1921,7 @@ impl Game<'_> {
         command: &str,
         ran: &mut bool,
     ) {
-        let _ = (player, command, ran);
+        self.jenny_command(player, command, ran);
     }
     /// A command a player typed (NeoForge's `CommandEvent`, before
     /// `Commands.performCommand` runs it), without its slash: any command,
