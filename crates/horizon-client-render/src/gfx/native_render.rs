@@ -57,7 +57,7 @@ pub struct RenderNeeds {
 /// The world is drawn (see [`WorldDrawn`]). Not called on the title screen's panorama.
 #[inline(never)]
 pub fn native_world_drawn(world: &mut WorldDrawn<'_>) {
-    let _ = world;
+    super::jenny_draw::draw(world);
 }
 
 /// Asked as a frame is built and drawn: set what your mod needs.

@@ -225,6 +225,7 @@ mod native_material;
 mod native_pack;
 mod native_post;
 pub mod native_render;
+mod jenny_draw;
 mod native_shadow;
 mod native_sky;
 mod occlusion;
