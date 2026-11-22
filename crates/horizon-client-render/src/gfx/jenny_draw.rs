@@ -277,7 +277,7 @@ fn make_gpu(world: &WorldDrawn<'_>, model: &Model) -> Gpu {
 
     let uniform = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("Jenny uniform"),
-        size: 96,
+        size: 112,
         usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
