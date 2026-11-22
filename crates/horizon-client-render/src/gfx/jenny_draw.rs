@@ -10,7 +10,7 @@ const TEX_SIZE: u32 = 1024;
 /// Bedrock gira com sinal oposto a regra da mao direita.
 const SIGN: f32 = -1.0;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-const VERTEX_STRIDE: u64 = 32;
+const VERTEX_STRIDE: u64 = 44;
 
 const SHADER: &str = r#"
 struct U {
@@ -28,14 +28,16 @@ struct VOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) n: vec3<f32>,
+    @location(2) tint: vec3<f32>,
 };
 
 @vertex
-fn vs(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) n: vec3<f32>) -> VOut {
+fn vs(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) n: vec3<f32>, @location(3) t: vec3<f32>) -> VOut {
     var o: VOut;
     o.pos = u.vp * vec4<f32>(p + u.offset.xyz, 1.0);
     o.uv = uv;
     o.n = n;
+    o.tint = t;
     return o;
 }
 
@@ -51,9 +53,15 @@ fn fs(i: VOut) -> @location(0) vec4<f32> {
     if (c.a < 0.5) {
         discard;
     }
+    var rgb = c.rgb;
+    // Camadas "armor" sao pintadas de ciano e tingidas na hora (como o mod faz).
+    if (c.r < 0.59 && c.g > 0.55 && c.b > 0.51 && (c.g - c.r) > 0.16) {
+        let lum = c.r * 0.3 + c.g * 0.59 + c.b * 0.11;
+        rgb = vec3<f32>(lum, lum, lum) * i.tint * 1.6;
+    }
     let l = clamp(dot(normalize(i.n), normalize(vec3<f32>(0.3, 0.9, 0.4))), 0.0, 1.0);
     let shade = 0.62 + 0.38 * l;
-    return vec4<f32>(c.rgb * shade, 1.0);
+    return vec4<f32>(rgb * shade, 1.0);
 }
 "#;
 
@@ -67,8 +75,8 @@ struct Bone {
 
 struct Model {
     bones: Vec<Bone>,
-    /// pos(3) uv(2) normal(3), em blocos, na pose de repouso.
-    verts: Vec<[f32; 8]>,
+    /// pos(3) uv(2) normal(3) tint(3), em blocos, na pose de repouso.
+    verts: Vec<[f32; 11]>,
 }
 
 fn rd_u32(b: &[u8], p: &mut usize) -> u32 {
@@ -98,7 +106,7 @@ fn parse_model() -> Model {
     let total = rd_u32(MODEL, &mut p) as usize;
     let mut verts = Vec::with_capacity(total);
     for _ in 0..total {
-        let mut v = [0.0f32; 8];
+        let mut v = [0.0f32; 11];
         for x in v.iter_mut() {
             *x = rd_f32(MODEL, &mut p);
         }
@@ -130,7 +138,7 @@ fn build_vertices(model: &Model, yaw: f32) -> Vec<u8> {
         for v in &model.verts[b.first..b.first + b.count] {
             let pos = m.transform_point3(Vec3::new(v[0], v[1], v[2]));
             let n = m.transform_vector3(Vec3::new(v[5], v[6], v[7])).normalize_or_zero();
-            for x in [pos.x, pos.y, pos.z, v[3], v[4], n.x, n.y, n.z] {
+            for x in [pos.x, pos.y, pos.z, v[3], v[4], n.x, n.y, n.z, v[8], v[9], v[10]] {
                 out.extend_from_slice(&x.to_le_bytes());
             }
         }
@@ -235,6 +243,7 @@ fn make_gpu(world: &WorldDrawn<'_>, model: &Model) -> Gpu {
         ..Default::default()
     });
     let attributes = [
+        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 32, shader_location: 3 },
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 12, shader_location: 1 },
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 20, shader_location: 2 },
@@ -350,6 +359,21 @@ fn push_f32s(out: &mut Vec<u8>, values: &[f32]) {
     }
 }
 
+/// A Jenny (esfera em volta dela) esta dentro do campo de visao?
+fn visible(vp: &Mat4, c: Vec3, r: f32) -> bool {
+    let m = vp.to_cols_array();
+    let row = |i: usize| Vec4::new(m[i], m[4 + i], m[8 + i], m[12 + i]);
+    let r3 = row(3);
+    for p in [r3 + row(0), r3 - row(0), r3 + row(1), r3 - row(1)] {
+        let d = p.x * c.x + p.y * c.y + p.z * c.z + p.w;
+        let len = (p.x * p.x + p.y * p.y + p.z * p.z).sqrt();
+        if d < -r * len {
+            return false;
+        }
+    }
+    true
+}
+
 /// Chamado todo quadro com o mundo ja desenhado.
 pub(super) fn draw(world: &mut WorldDrawn<'_>) {
     let mut guard = match STATE.lock() {
@@ -400,6 +424,12 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
         world.queue.write_buffer(&gpu.vertices, 0, &bytes);
     }
 
+    // Fora da tela: nao gasta GPU nenhuma.
+    let center = (anchor - camera).as_vec3() + Vec3::new(0.0, 1.0, 0.0);
+    if !visible(&world.view_proj, center, 1.6) {
+        return;
+    }
+
     // Profundidade propria, pra Jenny nao se atravessar.
     let size = world.size;
     let depth_ok = matches!(&gpu.depth_view, Some((_, s)) if *s == size);
@@ -422,7 +452,7 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
     };
 
     let offset = (anchor - camera).as_vec3();
-    let mut u: Vec<u8> = Vec::with_capacity(96);
+    let mut u: Vec<u8> = Vec::with_capacity(112);
     push_f32s(&mut u, &world.jittered.to_cols_array());
     push_f32s(&mut u, &[offset.x, offset.y, offset.z, 0.0]);
     push_f32s(&mut u, &[size[0] as f32, size[1] as f32, 0.0, 0.0]);
