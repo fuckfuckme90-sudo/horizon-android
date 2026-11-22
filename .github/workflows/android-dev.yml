@@ -123,7 +123,7 @@ jobs:
           out = Path('dist')
           out.mkdir()
           sha, abi = os.environ['GITHUB_SHA'], os.environ['ABI']
-          name = f'Horizon-Android-dev.{os.environ["GITHUB_RUN_NUMBER"]}.{sha[:12]}-{abi}.apk'
+          name = f'Polycraft-dev.{os.environ["GITHUB_RUN_NUMBER"]}.{sha[:12]}-{abi}.apk'
           apk = out / name
           shutil.copyfile(Path('.local/android/apk') / abi / 'horizon-android-public.apk', apk)
           (out / 'SHA256SUMS.txt').write_text(f'{hashlib.sha256(apk.read_bytes()).hexdigest()}  {name}\n')
@@ -139,7 +139,7 @@ jobs:
           PY
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: horizon-dev-${{ github.run_number }}-${{ matrix.abi }}
+          name: polycraft-dev-${{ github.run_number }}-${{ matrix.abi }}
           path: dist/
           if-no-files-found: error
           retention-days: 14

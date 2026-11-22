@@ -1,12 +1,26 @@
-//! Jenny no mundo: le o modelo Bedrock (jenny/jenny.bin, feito do .geo.json) e
+//! Personagens no mundo: le os modelos Bedrock (chars/*.bin, feitos dos .geo.json) e
 //! desenha os ossos direto na GPU, no ponto `native_world_drawn`.
 use super::native_render::WorldDrawn;
 use glam::{DVec3, Mat4, Vec3, Vec4};
 use std::sync::Mutex;
 
-const MODEL: &[u8] = include_bytes!("jenny/jenny.bin");
-const TEXTURE: &[u8] = include_bytes!("jenny/jenny.rgba");
+struct CharDef {
+    model: &'static [u8],
+    texture: &'static [u8],
+}
+
+/// Ordem na fila (esquerda -> direita): Jenny, Ellie, Bia, Allie, Slime.
+const CHARS: [CharDef; 5] = [
+    CharDef { model: include_bytes!("chars/jenny.bin"), texture: include_bytes!("chars/jenny.rgba") },
+    CharDef { model: include_bytes!("chars/ellie.bin"), texture: include_bytes!("chars/ellie.rgba") },
+    CharDef { model: include_bytes!("chars/bia.bin"), texture: include_bytes!("chars/bia.rgba") },
+    CharDef { model: include_bytes!("chars/allie.bin"), texture: include_bytes!("chars/allie.rgba") },
+    CharDef { model: include_bytes!("chars/slime.bin"), texture: include_bytes!("chars/slime.rgba") },
+];
 const TEX_SIZE: u32 = 1024;
+/// Distancia da camera e espaco entre personagens (em blocos).
+const SPAWN_DIST: f64 = 5.0;
+const SPACING: f32 = 1.3;
 /// Bedrock gira com sinal oposto a regra da mao direita.
 const SIGN: f32 = -1.0;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -89,26 +103,26 @@ fn rd_f32(b: &[u8], p: &mut usize) -> f32 {
     f32::from_bits(rd_u32(b, p))
 }
 
-fn parse_model() -> Model {
+fn parse_model(data: &[u8]) -> Model {
     let mut p = 4;
-    let nb = rd_u32(MODEL, &mut p) as usize;
+    let nb = rd_u32(data, &mut p) as usize;
     let mut bones = Vec::with_capacity(nb);
     for _ in 0..nb {
-        let parent = rd_u32(MODEL, &mut p) as i32;
-        let pivot = Vec3::new(rd_f32(MODEL, &mut p), rd_f32(MODEL, &mut p), rd_f32(MODEL, &mut p));
-        let rot = Vec3::new(rd_f32(MODEL, &mut p), rd_f32(MODEL, &mut p), rd_f32(MODEL, &mut p));
-        let first = rd_u32(MODEL, &mut p) as usize;
-        let count = rd_u32(MODEL, &mut p) as usize;
-        let name_len = MODEL[p] as usize;
+        let parent = rd_u32(data, &mut p) as i32;
+        let pivot = Vec3::new(rd_f32(data, &mut p), rd_f32(data, &mut p), rd_f32(data, &mut p));
+        let rot = Vec3::new(rd_f32(data, &mut p), rd_f32(data, &mut p), rd_f32(data, &mut p));
+        let first = rd_u32(data, &mut p) as usize;
+        let count = rd_u32(data, &mut p) as usize;
+        let name_len = data[p] as usize;
         p += 1 + name_len;
         bones.push(Bone { parent, pivot, rot, first, count });
     }
-    let total = rd_u32(MODEL, &mut p) as usize;
+    let total = rd_u32(data, &mut p) as usize;
     let mut verts = Vec::with_capacity(total);
     for _ in 0..total {
         let mut v = [0.0f32; 11];
         for x in v.iter_mut() {
-            *x = rd_f32(MODEL, &mut p);
+            *x = rd_f32(data, &mut p);
         }
         verts.push(v);
     }
@@ -118,9 +132,10 @@ fn parse_model() -> Model {
 fn bone_matrices(model: &Model) -> Vec<Mat4> {
     let mut world: Vec<Mat4> = Vec::with_capacity(model.bones.len());
     for b in &model.bones {
-        let r = Mat4::from_rotation_x(SIGN * b.rot.x.to_radians())
+        // Bedrock: ordem ZYX (X aplicado primeiro).
+        let r = Mat4::from_rotation_z(SIGN * b.rot.z.to_radians())
             * Mat4::from_rotation_y(SIGN * b.rot.y.to_radians())
-            * Mat4::from_rotation_z(SIGN * b.rot.z.to_radians());
+            * Mat4::from_rotation_x(SIGN * b.rot.x.to_radians());
         let local = Mat4::from_translation(b.pivot) * r * Mat4::from_translation(-b.pivot);
         let m = if b.parent >= 0 { world[b.parent as usize] * local } else { local };
         world.push(m);
@@ -157,23 +172,29 @@ fn build_indices(vertex_count: usize) -> Vec<u8> {
     out
 }
 
-struct Gpu {
+struct Shared {
     format: wgpu::TextureFormat,
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+    depth_view: Option<(wgpu::TextureView, [u32; 2])>,
+}
+
+struct CharGpu {
     uniform: wgpu::Buffer,
     vertices: wgpu::Buffer,
     indices: wgpu::Buffer,
     index_count: u32,
     tex_view: wgpu::TextureView,
-    sampler: wgpu::Sampler,
-    depth_view: Option<(wgpu::TextureView, [u32; 2])>,
 }
 
 struct State {
-    model: Model,
-    gpu: Option<Gpu>,
+    models: Vec<Model>,
+    shared: Option<Shared>,
+    chars: Vec<CharGpu>,
     anchor: Option<DVec3>,
+    right: Vec3,
+    yaw: f32,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -187,17 +208,17 @@ fn texture_format_for(target: wgpu::TextureFormat) -> wgpu::TextureFormat {
     }
 }
 
-fn make_gpu(world: &WorldDrawn<'_>, model: &Model) -> Gpu {
+fn make_gpu(world: &WorldDrawn<'_>, models: &[Model]) -> (Shared, Vec<CharGpu>) {
     let device = world.device;
     let queue = world.queue;
     let format = world.color_format;
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Jenny"),
+        label: Some("Personagens"),
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
     });
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("Jenny bindings"),
+        label: Some("Personagens bindings"),
         entries: &[
             wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -238,7 +259,7 @@ fn make_gpu(world: &WorldDrawn<'_>, model: &Model) -> Gpu {
         ],
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("Jenny"),
+        label: Some("Personagens"),
         bind_group_layouts: &[Some(&layout)],
         ..Default::default()
     });
@@ -249,7 +270,7 @@ fn make_gpu(world: &WorldDrawn<'_>, model: &Model) -> Gpu {
         wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 20, shader_location: 2 },
     ];
     let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some("Jenny"),
+        label: Some("Personagens"),
         layout: Some(&pipeline_layout),
         vertex: wgpu::VertexState {
             module: &shader,
@@ -283,74 +304,73 @@ fn make_gpu(world: &WorldDrawn<'_>, model: &Model) -> Gpu {
         multiview_mask: None,
         cache: None,
     });
-
-    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Jenny uniform"),
-        size: 112,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let vertices = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Jenny vertices"),
-        size: model.verts.len() as u64 * VERTEX_STRIDE,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let index_bytes = build_indices(model.verts.len());
-    let indices = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Jenny indices"),
-        size: index_bytes.len() as u64,
-        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&indices, 0, &index_bytes);
-
-    let extent = wgpu::Extent3d { width: TEX_SIZE, height: TEX_SIZE, depth_or_array_layers: 1 };
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("Jenny texture"),
-        size: extent,
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: texture_format_for(format),
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        TEXTURE,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(TEX_SIZE * 4),
-            rows_per_image: Some(TEX_SIZE),
-        },
-        extent,
-    );
-    let tex_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("Jenny sampler"),
+        label: Some("Personagens sampler"),
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
         ..Default::default()
     });
 
-    Gpu {
-        format,
-        pipeline,
-        layout,
-        uniform,
-        vertices,
-        indices,
-        index_count: (model.verts.len() / 4 * 6) as u32,
-        tex_view,
-        sampler,
-        depth_view: None,
+    let mut chars: Vec<CharGpu> = Vec::with_capacity(models.len());
+    for (i, model) in models.iter().enumerate() {
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Personagem uniform"),
+            size: 112,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let vertices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Personagem vertices"),
+            size: model.verts.len() as u64 * VERTEX_STRIDE,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let index_bytes = build_indices(model.verts.len());
+        let indices = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Personagem indices"),
+            size: index_bytes.len() as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&indices, 0, &index_bytes);
+
+        let extent = wgpu::Extent3d { width: TEX_SIZE, height: TEX_SIZE, depth_or_array_layers: 1 };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Personagem texture"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: texture_format_for(format),
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            CHARS[i].texture,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(TEX_SIZE * 4),
+                rows_per_image: Some(TEX_SIZE),
+            },
+            extent,
+        );
+        let tex_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        chars.push(CharGpu {
+            uniform,
+            vertices,
+            indices,
+            index_count: (model.verts.len() / 4 * 6) as u32,
+            tex_view,
+        });
     }
+
+    (Shared { format, pipeline, layout, sampler, depth_view: None }, chars)
 }
 
 fn push_f32s(out: &mut Vec<u8>, values: &[f32]) {
@@ -359,7 +379,7 @@ fn push_f32s(out: &mut Vec<u8>, values: &[f32]) {
     }
 }
 
-/// A Jenny (esfera em volta dela) esta dentro do campo de visao?
+/// A esfera em volta da personagem esta dentro do campo de visao?
 fn visible(vp: &Mat4, c: Vec3, r: f32) -> bool {
     let m = vp.to_cols_array();
     let row = |i: usize| Vec4::new(m[i], m[4 + i], m[8 + i], m[12 + i]);
@@ -380,16 +400,21 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
         Ok(g) => g,
         Err(_) => return,
     };
-    let state = guard.get_or_insert_with(|| State { model: parse_model(), gpu: None, anchor: None });
+    let state = guard.get_or_insert_with(|| State {
+        models: CHARS.iter().map(|c| parse_model(c.model)).collect(),
+        shared: None,
+        chars: Vec::new(),
+        anchor: None,
+        right: Vec3::X,
+        yaw: 0.0,
+    });
 
-    // Posicao: 3 blocos na frente da camera, virada pra ela, perto do chao.
+    // Posicao: fila de personagens na frente da camera, viradas pra ela, no chao.
     let camera = world.camera;
     let too_far = match state.anchor {
         Some(a) => (a - camera).length() > 48.0,
         None => true,
     };
-    let rebuild = too_far;
-    let mut yaw = 0.0f32;
     if too_far {
         let inv = world.view_proj.inverse();
         let p = inv * Vec4::new(0.0, 0.0, 0.5, 1.0);
@@ -398,44 +423,62 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
             dir = Vec3::new(0.0, 0.0, -1.0);
         }
         let dir = dir.normalize();
-        state.anchor = Some(camera + DVec3::new(dir.x as f64, 0.0, dir.z as f64) * 3.0 - DVec3::new(0.0, 1.62, 0.0));
+        state.anchor = Some(camera + DVec3::new(dir.x as f64, 0.0, dir.z as f64) * SPAWN_DIST - DVec3::new(0.0, 1.62, 0.0));
+        // Direita de quem olha na direcao `dir`.
+        state.right = Vec3::new(-dir.z, 0.0, dir.x);
         // O rosto do modelo olha pra -Z; queremos que olhe pra camera (-dir).
-        yaw = (-dir.x).atan2(-dir.z);
+        state.yaw = (-dir.x).atan2(-dir.z);
     }
     let anchor = match state.anchor {
         Some(a) => a,
         None => return,
     };
 
-    let needs_gpu = match &state.gpu {
-        Some(g) => g.format != world.color_format,
+    let needs_gpu = match &state.shared {
+        Some(s) => s.format != world.color_format,
         None => true,
     };
     if needs_gpu {
-        state.gpu = Some(make_gpu(world, &state.model));
+        let (shared, chars) = make_gpu(world, &state.models);
+        state.shared = Some(shared);
+        state.chars = chars;
     }
-    let State { model, gpu, .. } = state;
-    let gpu = match gpu {
-        Some(g) => g,
+    let rebuild = too_far || needs_gpu;
+    let State { models, shared, chars, right, yaw, .. } = state;
+    let shared = match shared {
+        Some(s) => s,
         None => return,
     };
-    if rebuild || needs_gpu {
-        let bytes = build_vertices(model, yaw);
-        world.queue.write_buffer(&gpu.vertices, 0, &bytes);
+    if rebuild {
+        for (i, model) in models.iter().enumerate() {
+            let bytes = build_vertices(model, *yaw);
+            world.queue.write_buffer(&chars[i].vertices, 0, &bytes);
+        }
     }
 
-    // Fora da tela: nao gasta GPU nenhuma.
-    let center = (anchor - camera).as_vec3() + Vec3::new(0.0, 1.0, 0.0);
-    if !visible(&world.view_proj, center, 1.6) {
+    // Quais personagens estao na tela (fora dela nao gasta GPU nenhuma).
+    let count = chars.len();
+    let mut offsets: Vec<Vec3> = Vec::with_capacity(count);
+    let mut shown: Vec<usize> = Vec::with_capacity(count);
+    for i in 0..count {
+        let slide = (i as f32 - (count as f32 - 1.0) / 2.0) * SPACING;
+        let pos = anchor + DVec3::new((right.x * slide) as f64, 0.0, (right.z * slide) as f64);
+        let offset = (pos - camera).as_vec3();
+        if visible(&world.view_proj, offset + Vec3::new(0.0, 1.0, 0.0), 1.6) {
+            shown.push(i);
+        }
+        offsets.push(offset);
+    }
+    if shown.is_empty() {
         return;
     }
 
-    // Profundidade propria, pra Jenny nao se atravessar.
+    // Profundidade propria, pra elas nao se atravessarem.
     let size = world.size;
-    let depth_ok = matches!(&gpu.depth_view, Some((_, s)) if *s == size);
+    let depth_ok = matches!(&shared.depth_view, Some((_, s)) if *s == size);
     if !depth_ok {
         let texture = world.device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Jenny depth"),
+            label: Some("Personagens depth"),
             size: wgpu::Extent3d { width: size[0].max(1), height: size[1].max(1), depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
@@ -444,34 +487,36 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-        gpu.depth_view = Some((texture.create_view(&wgpu::TextureViewDescriptor::default()), size));
+        shared.depth_view = Some((texture.create_view(&wgpu::TextureViewDescriptor::default()), size));
     }
-    let depth_view = match &gpu.depth_view {
+    let depth_view = match &shared.depth_view {
         Some((v, _)) => v,
         None => return,
     };
 
-    let offset = (anchor - camera).as_vec3();
-    let mut u: Vec<u8> = Vec::with_capacity(112);
-    push_f32s(&mut u, &world.jittered.to_cols_array());
-    push_f32s(&mut u, &[offset.x, offset.y, offset.z, 0.0]);
-    push_f32s(&mut u, &[size[0] as f32, size[1] as f32, 0.0, 0.0]);
-    push_f32s(&mut u, &[world.depth_size[0] as f32, world.depth_size[1] as f32, 0.0, 0.0]);
-    world.queue.write_buffer(&gpu.uniform, 0, &u);
-
-    let bind_group = world.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Jenny"),
-        layout: &gpu.layout,
-        entries: &[
-            wgpu::BindGroupEntry { binding: 0, resource: gpu.uniform.as_entire_binding() },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&gpu.tex_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&gpu.sampler) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(world.depth) },
-        ],
-    });
+    let mut groups: Vec<wgpu::BindGroup> = Vec::with_capacity(shown.len());
+    for &i in &shown {
+        let offset = offsets[i];
+        let mut u: Vec<u8> = Vec::with_capacity(112);
+        push_f32s(&mut u, &world.jittered.to_cols_array());
+        push_f32s(&mut u, &[offset.x, offset.y, offset.z, 0.0]);
+        push_f32s(&mut u, &[size[0] as f32, size[1] as f32, 0.0, 0.0]);
+        push_f32s(&mut u, &[world.depth_size[0] as f32, world.depth_size[1] as f32, 0.0, 0.0]);
+        world.queue.write_buffer(&chars[i].uniform, 0, &u);
+        groups.push(world.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Personagem"),
+            layout: &shared.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: chars[i].uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&chars[i].tex_view) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&shared.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(world.depth) },
+            ],
+        }));
+    }
 
     let mut pass = world.encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("Jenny"),
+        label: Some("Personagens"),
         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
             view: world.color_view,
             resolve_target: None,
@@ -485,9 +530,11 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
         }),
         ..Default::default()
     });
-    pass.set_pipeline(&gpu.pipeline);
-    pass.set_bind_group(0, &bind_group, &[]);
-    pass.set_vertex_buffer(0, gpu.vertices.slice(..));
-    pass.set_index_buffer(gpu.indices.slice(..), wgpu::IndexFormat::Uint32);
-    pass.draw_indexed(0..gpu.index_count, 0, 0..1);
+    pass.set_pipeline(&shared.pipeline);
+    for (k, &i) in shown.iter().enumerate() {
+        pass.set_bind_group(0, &groups[k], &[]);
+        pass.set_vertex_buffer(0, chars[i].vertices.slice(..));
+        pass.set_index_buffer(chars[i].indices.slice(..), wgpu::IndexFormat::Uint32);
+        pass.draw_indexed(0..chars[i].index_count, 0, 0..1);
+    }
 }
