@@ -7,15 +7,16 @@ use std::sync::Mutex;
 struct CharDef {
     model: &'static [u8],
     texture: &'static [u8],
+    anim: &'static [u8],
 }
 
 /// Ordem na fila (esquerda -> direita): Jenny, Ellie, Bia, Allie, Slime.
 const CHARS: [CharDef; 5] = [
-    CharDef { model: include_bytes!("chars/jenny.bin"), texture: include_bytes!("chars/jenny.rgba") },
-    CharDef { model: include_bytes!("chars/ellie.bin"), texture: include_bytes!("chars/ellie.rgba") },
-    CharDef { model: include_bytes!("chars/bia.bin"), texture: include_bytes!("chars/bia.rgba") },
-    CharDef { model: include_bytes!("chars/allie.bin"), texture: include_bytes!("chars/allie.rgba") },
-    CharDef { model: include_bytes!("chars/slime.bin"), texture: include_bytes!("chars/slime.rgba") },
+    CharDef { model: include_bytes!("chars/jenny.bin"), texture: include_bytes!("chars/jenny.rgba"), anim: include_bytes!("chars/jenny_idle.anim") },
+    CharDef { model: include_bytes!("chars/ellie.bin"), texture: include_bytes!("chars/ellie.rgba"), anim: include_bytes!("chars/ellie_idle.anim") },
+    CharDef { model: include_bytes!("chars/bia.bin"), texture: include_bytes!("chars/bia.rgba"), anim: include_bytes!("chars/bia_idle.anim") },
+    CharDef { model: include_bytes!("chars/allie.bin"), texture: include_bytes!("chars/allie.rgba"), anim: include_bytes!("chars/allie_idle.anim") },
+    CharDef { model: include_bytes!("chars/slime.bin"), texture: include_bytes!("chars/slime.rgba"), anim: include_bytes!("chars/slime_idle.anim") },
 ];
 const TEX_SIZE: u32 = 1024;
 /// Distancia da camera e espaco entre personagens (em blocos).
@@ -87,7 +88,15 @@ struct Bone {
     count: usize,
 }
 
+struct Anim {
+    frames: usize,
+    fps: f32,
+    /// (indice do osso, frames de [rot xyz, pos xyz]); rot em graus, pos em blocos.
+    tracks: Vec<(usize, Vec<[f32; 6]>)>,
+}
+
 struct Model {
+    anim: Option<Anim>,
     bones: Vec<Bone>,
     /// pos(3) uv(2) normal(3) tint(3), em blocos, na pose de repouso.
     verts: Vec<[f32; 11]>,
@@ -126,17 +135,64 @@ fn parse_model(data: &[u8]) -> Model {
         }
         verts.push(v);
     }
-    Model { bones, verts }
+    Model { anim: None, bones, verts }
 }
 
-fn bone_matrices(model: &Model) -> Vec<Mat4> {
-    let mut world: Vec<Mat4> = Vec::with_capacity(model.bones.len());
-    for b in &model.bones {
-        // Bedrock: ordem ZYX (X aplicado primeiro).
-        let r = Mat4::from_rotation_z(SIGN * b.rot.z.to_radians())
-            * Mat4::from_rotation_y(SIGN * b.rot.y.to_radians())
-            * Mat4::from_rotation_x(SIGN * b.rot.x.to_radians());
-        let local = Mat4::from_translation(b.pivot) * r * Mat4::from_translation(-b.pivot);
+fn parse_anim(data: &[u8]) -> Option<Anim> {
+    if data.len() < 16 || &data[0..4] != b"JAN1" {
+        return None;
+    }
+    let mut p = 4;
+    let frames = rd_u32(data, &mut p) as usize;
+    let fps = rd_f32(data, &mut p);
+    let nt = rd_u32(data, &mut p) as usize;
+    if frames == 0 || fps <= 0.0 {
+        return None;
+    }
+    let mut tracks = Vec::with_capacity(nt);
+    for _ in 0..nt {
+        let bone = rd_u32(data, &mut p) as usize;
+        let mut fr: Vec<[f32; 6]> = Vec::with_capacity(frames);
+        for _ in 0..frames {
+            let mut a = [0.0f32; 6];
+            for x in a.iter_mut() {
+                *x = rd_f32(data, &mut p);
+            }
+            fr.push(a);
+        }
+        tracks.push((bone, fr));
+    }
+    Some(Anim { frames, fps, tracks })
+}
+
+fn bone_matrices(model: &Model, t: f32) -> Vec<Mat4> {
+    let n = model.bones.len();
+    let mut drot = vec![Vec3::ZERO; n];
+    let mut dpos = vec![Vec3::ZERO; n];
+    if let Some(a) = &model.anim {
+        let f = (t * a.fps).rem_euclid(a.frames as f32);
+        let i0 = (f.floor() as usize).min(a.frames - 1);
+        let i1 = (i0 + 1) % a.frames;
+        let k = f - i0 as f32;
+        for (bone, fr) in &a.tracks {
+            if *bone >= n {
+                continue;
+            }
+            let p = &fr[i0];
+            let q = &fr[i1];
+            let l = |j: usize| p[j] + (q[j] - p[j]) * k;
+            drot[*bone] = Vec3::new(l(0), l(1), l(2));
+            dpos[*bone] = Vec3::new(l(3), l(4), l(5));
+        }
+    }
+    let mut world: Vec<Mat4> = Vec::with_capacity(n);
+    for (i, b) in model.bones.iter().enumerate() {
+        // Bedrock: ordem ZYX (X aplicado primeiro). A animacao soma na rotacao de repouso.
+        let rot = b.rot + drot[i];
+        let r = Mat4::from_rotation_z(SIGN * rot.z.to_radians())
+            * Mat4::from_rotation_y(SIGN * rot.y.to_radians())
+            * Mat4::from_rotation_x(SIGN * rot.x.to_radians());
+        let local = Mat4::from_translation(dpos[i]) * Mat4::from_translation(b.pivot) * r * Mat4::from_translation(-b.pivot);
         let m = if b.parent >= 0 { world[b.parent as usize] * local } else { local };
         world.push(m);
     }
@@ -144,8 +200,8 @@ fn bone_matrices(model: &Model) -> Vec<Mat4> {
 }
 
 /// Vertices ja na pose, virados `yaw` radianos em Y, em bytes prontos pro buffer.
-fn build_vertices(model: &Model, yaw: f32) -> Vec<u8> {
-    let mats = bone_matrices(model);
+fn build_vertices(model: &Model, yaw: f32, t: f32) -> Vec<u8> {
+    let mats = bone_matrices(model, t);
     let turn = Mat4::from_rotation_y(yaw);
     let mut out: Vec<u8> = Vec::with_capacity(model.verts.len() * VERTEX_STRIDE as usize);
     for (i, b) in model.bones.iter().enumerate() {
@@ -195,6 +251,7 @@ struct State {
     anchor: Option<DVec3>,
     right: Vec3,
     yaw: f32,
+    start: std::time::Instant,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -401,13 +458,22 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
         Err(_) => return,
     };
     let state = guard.get_or_insert_with(|| State {
-        models: CHARS.iter().map(|c| parse_model(c.model)).collect(),
+        models: CHARS
+            .iter()
+            .map(|c| {
+                let mut m = parse_model(c.model);
+                m.anim = parse_anim(c.anim);
+                m
+            })
+            .collect(),
         shared: None,
         chars: Vec::new(),
         anchor: None,
         right: Vec3::X,
         yaw: 0.0,
+        start: std::time::Instant::now(),
     });
+    let t = state.start.elapsed().as_secs_f32();
 
     // Posicao: fila de personagens na frente da camera, viradas pra ela, no chao.
     let camera = world.camera;
@@ -451,7 +517,7 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
     };
     if rebuild {
         for (i, model) in models.iter().enumerate() {
-            let bytes = build_vertices(model, *yaw);
+            let bytes = build_vertices(model, *yaw, t);
             world.queue.write_buffer(&chars[i].vertices, 0, &bytes);
         }
     }
@@ -471,6 +537,11 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
     }
     if shown.is_empty() {
         return;
+    }
+    // Animacao: refaz a pose so dos personagens que aparecem.
+    for &i in &shown {
+        let bytes = build_vertices(&models[i], *yaw, t);
+        world.queue.write_buffer(&chars[i].vertices, 0, &bytes);
     }
 
     // Profundidade propria, pra elas nao se atravessarem.
