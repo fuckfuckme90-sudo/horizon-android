@@ -7,21 +7,25 @@ use std::sync::Mutex;
 struct CharDef {
     model: &'static [u8],
     texture: &'static [u8],
-    anim: &'static [u8],
+    anim_idle: &'static [u8],
+    anim_walk: &'static [u8],
 }
 
 /// Ordem na fila (esquerda -> direita): Jenny, Ellie, Bia, Allie, Slime.
 const CHARS: [CharDef; 5] = [
-    CharDef { model: include_bytes!("chars/jenny.bin"), texture: include_bytes!("chars/jenny.rgba"), anim: include_bytes!("chars/jenny_idle.anim") },
-    CharDef { model: include_bytes!("chars/ellie.bin"), texture: include_bytes!("chars/ellie.rgba"), anim: include_bytes!("chars/ellie_idle.anim") },
-    CharDef { model: include_bytes!("chars/bia.bin"), texture: include_bytes!("chars/bia.rgba"), anim: include_bytes!("chars/bia_idle.anim") },
-    CharDef { model: include_bytes!("chars/allie.bin"), texture: include_bytes!("chars/allie.rgba"), anim: include_bytes!("chars/allie_idle.anim") },
-    CharDef { model: include_bytes!("chars/slime.bin"), texture: include_bytes!("chars/slime.rgba"), anim: include_bytes!("chars/slime_idle.anim") },
+    CharDef { model: include_bytes!("chars/jenny.bin"), texture: include_bytes!("chars/jenny.rgba"), anim_idle: include_bytes!("chars/jenny_idle.anim"), anim_walk: include_bytes!("chars/jenny_walk.anim") },
+    CharDef { model: include_bytes!("chars/ellie.bin"), texture: include_bytes!("chars/ellie.rgba"), anim_idle: include_bytes!("chars/ellie_idle.anim"), anim_walk: include_bytes!("chars/ellie_walk.anim") },
+    CharDef { model: include_bytes!("chars/bia.bin"), texture: include_bytes!("chars/bia.rgba"), anim_idle: include_bytes!("chars/bia_idle.anim"), anim_walk: include_bytes!("chars/bia_walk.anim") },
+    CharDef { model: include_bytes!("chars/allie.bin"), texture: include_bytes!("chars/allie.rgba"), anim_idle: include_bytes!("chars/allie_idle.anim"), anim_walk: include_bytes!("chars/allie_walk.anim") },
+    CharDef { model: include_bytes!("chars/slime.bin"), texture: include_bytes!("chars/slime.rgba"), anim_idle: include_bytes!("chars/slime_idle.anim"), anim_walk: include_bytes!("chars/slime_walk.anim") },
 ];
 const TEX_SIZE: u32 = 1024;
 /// Distancia da camera e espaco entre personagens (em blocos).
 const SPAWN_DIST: f64 = 5.0;
-const SPACING: f32 = 1.3;
+const SPACING: f32 = 1.8;
+/// Passeio: raio (blocos) em volta do lugar de cada uma e velocidade (blocos/s).
+const WANDER_RADIUS: f32 = 1.4;
+const WALK_SPEED: f32 = 1.0;
 /// Bedrock gira com sinal oposto a regra da mao direita.
 const SIGN: f32 = -1.0;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -96,7 +100,8 @@ struct Anim {
 }
 
 struct Model {
-    anim: Option<Anim>,
+    idle: Option<Anim>,
+    walk: Option<Anim>,
     bones: Vec<Bone>,
     /// pos(3) uv(2) normal(3) tint(3), em blocos, na pose de repouso.
     verts: Vec<[f32; 11]>,
@@ -135,7 +140,7 @@ fn parse_model(data: &[u8]) -> Model {
         }
         verts.push(v);
     }
-    Model { anim: None, bones, verts }
+    Model { idle: None, walk: None, bones, verts }
 }
 
 fn parse_anim(data: &[u8]) -> Option<Anim> {
@@ -165,25 +170,44 @@ fn parse_anim(data: &[u8]) -> Option<Anim> {
     Some(Anim { frames, fps, tracks })
 }
 
-fn bone_matrices(model: &Model, t: f32) -> Vec<Mat4> {
+struct Pose {
+    t_idle: f32,
+    t_walk: f32,
+    /// 0 = parada (idle), 1 = andando (walk).
+    w: f32,
+}
+
+fn add_pose(a: &Anim, t: f32, weight: f32, drot: &mut [Vec3], dpos: &mut [Vec3]) {
+    if weight <= 0.0 {
+        return;
+    }
+    let n = drot.len();
+    let f = (t * a.fps).rem_euclid(a.frames as f32);
+    let i0 = (f.floor() as usize).min(a.frames - 1);
+    let i1 = (i0 + 1) % a.frames;
+    let k = f - i0 as f32;
+    for (bone, fr) in &a.tracks {
+        if *bone >= n {
+            continue;
+        }
+        let p = &fr[i0];
+        let q = &fr[i1];
+        let l = |j: usize| p[j] + (q[j] - p[j]) * k;
+        drot[*bone] += Vec3::new(l(0), l(1), l(2)) * weight;
+        dpos[*bone] += Vec3::new(l(3), l(4), l(5)) * weight;
+    }
+}
+
+fn bone_matrices(model: &Model, pose: &Pose) -> Vec<Mat4> {
     let n = model.bones.len();
     let mut drot = vec![Vec3::ZERO; n];
     let mut dpos = vec![Vec3::ZERO; n];
-    if let Some(a) = &model.anim {
-        let f = (t * a.fps).rem_euclid(a.frames as f32);
-        let i0 = (f.floor() as usize).min(a.frames - 1);
-        let i1 = (i0 + 1) % a.frames;
-        let k = f - i0 as f32;
-        for (bone, fr) in &a.tracks {
-            if *bone >= n {
-                continue;
-            }
-            let p = &fr[i0];
-            let q = &fr[i1];
-            let l = |j: usize| p[j] + (q[j] - p[j]) * k;
-            drot[*bone] = Vec3::new(l(0), l(1), l(2));
-            dpos[*bone] = Vec3::new(l(3), l(4), l(5));
-        }
+    let w = if model.walk.is_some() { pose.w.clamp(0.0, 1.0) } else { 0.0 };
+    if let Some(a) = &model.idle {
+        add_pose(a, pose.t_idle, 1.0 - w, &mut drot, &mut dpos);
+    }
+    if let Some(a) = &model.walk {
+        add_pose(a, pose.t_walk, w, &mut drot, &mut dpos);
     }
     let mut world: Vec<Mat4> = Vec::with_capacity(n);
     for (i, b) in model.bones.iter().enumerate() {
@@ -199,9 +223,91 @@ fn bone_matrices(model: &Model, t: f32) -> Vec<Mat4> {
     world
 }
 
+/// Passeio de cada personagem (so no cliente, no plano, sem colisao).
+struct Wander {
+    x: f32,
+    z: f32,
+    tx: f32,
+    tz: f32,
+    yaw: f32,
+    walking: bool,
+    wait: f32,
+    w: f32,
+    wt: f32,
+    rng: u32,
+}
+
+impl Wander {
+    fn new(yaw: f32, i: usize) -> Wander {
+        Wander {
+            x: 0.0,
+            z: 0.0,
+            tx: 0.0,
+            tz: 0.0,
+            yaw,
+            walking: false,
+            wait: 1.0 + i as f32 * 0.7,
+            w: 0.0,
+            wt: 0.0,
+            rng: 0x9E37_79B9u32.wrapping_mul(i as u32 + 1) | 1,
+        }
+    }
+}
+
+fn rnd(w: &mut Wander) -> f32 {
+    w.rng ^= w.rng << 13;
+    w.rng ^= w.rng >> 17;
+    w.rng ^= w.rng << 5;
+    (w.rng & 0x00FF_FFFF) as f32 / 16_777_216.0
+}
+
+fn turn_toward(cur: f32, want: f32, max: f32) -> f32 {
+    let tau = std::f32::consts::TAU;
+    let mut d = (want - cur) % tau;
+    if d > std::f32::consts::PI {
+        d -= tau;
+    }
+    if d < -std::f32::consts::PI {
+        d += tau;
+    }
+    cur + d.clamp(-max, max)
+}
+
+fn step_wander(w: &mut Wander, dt: f32, home_yaw: f32) {
+    if w.walking {
+        let dx = w.tx - w.x;
+        let dz = w.tz - w.z;
+        let d = (dx * dx + dz * dz).sqrt();
+        if d < 0.08 {
+            w.walking = false;
+            w.wait = 2.0 + rnd(w) * 5.0;
+        } else {
+            let step = (WALK_SPEED * dt).min(d);
+            w.x += dx / d * step;
+            w.z += dz / d * step;
+            w.yaw = turn_toward(w.yaw, dx.atan2(dz), 6.0 * dt);
+        }
+    } else {
+        w.yaw = turn_toward(w.yaw, home_yaw, 3.0 * dt);
+        w.wait -= dt;
+        if w.wait <= 0.0 {
+            let a = rnd(w) * std::f32::consts::TAU;
+            let r = (0.5 + rnd(w) * 0.5) * WANDER_RADIUS;
+            w.tx = a.cos() * r;
+            w.tz = a.sin() * r;
+            w.walking = true;
+        }
+    }
+    let goal = if w.walking { 1.0 } else { 0.0 };
+    w.w += (goal - w.w) * (dt / 0.25).min(1.0);
+    if w.w > 0.01 {
+        w.wt += dt;
+    }
+}
+
 /// Vertices ja na pose, virados `yaw` radianos em Y, em bytes prontos pro buffer.
-fn build_vertices(model: &Model, yaw: f32, t: f32) -> Vec<u8> {
-    let mats = bone_matrices(model, t);
+fn build_vertices(model: &Model, yaw: f32, pose: &Pose) -> Vec<u8> {
+    let mats = bone_matrices(model, pose);
     let turn = Mat4::from_rotation_y(yaw);
     let mut out: Vec<u8> = Vec::with_capacity(model.verts.len() * VERTEX_STRIDE as usize);
     for (i, b) in model.bones.iter().enumerate() {
@@ -252,6 +358,8 @@ struct State {
     right: Vec3,
     yaw: f32,
     start: std::time::Instant,
+    last_t: f32,
+    wander: Vec<Wander>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -462,7 +570,8 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
             .iter()
             .map(|c| {
                 let mut m = parse_model(c.model);
-                m.anim = parse_anim(c.anim);
+                m.idle = parse_anim(c.anim_idle);
+                m.walk = parse_anim(c.anim_walk);
                 m
             })
             .collect(),
@@ -472,6 +581,8 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
         right: Vec3::X,
         yaw: 0.0,
         start: std::time::Instant::now(),
+        last_t: 0.0,
+        wander: Vec::new(),
     });
     let t = state.start.elapsed().as_secs_f32();
 
@@ -500,6 +611,16 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
         None => return,
     };
 
+    let dt = (t - state.last_t).clamp(0.0, 0.1);
+    state.last_t = t;
+    let home_yaw = state.yaw;
+    if too_far || state.wander.len() != CHARS.len() {
+        state.wander = (0..CHARS.len()).map(|i| Wander::new(home_yaw, i)).collect();
+    }
+    for w in state.wander.iter_mut() {
+        step_wander(w, dt, home_yaw);
+    }
+
     let needs_gpu = match &state.shared {
         Some(s) => s.format != world.color_format,
         None => true,
@@ -510,14 +631,14 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
         state.chars = chars;
     }
     let rebuild = too_far || needs_gpu;
-    let State { models, shared, chars, right, yaw, .. } = state;
+    let State { models, shared, chars, right, wander, .. } = state;
     let shared = match shared {
         Some(s) => s,
         None => return,
     };
     if rebuild {
         for (i, model) in models.iter().enumerate() {
-            let bytes = build_vertices(model, *yaw, t);
+            let bytes = build_vertices(model, home_yaw, &Pose { t_idle: t, t_walk: 0.0, w: 0.0 });
             world.queue.write_buffer(&chars[i].vertices, 0, &bytes);
         }
     }
@@ -528,7 +649,7 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
     let mut shown: Vec<usize> = Vec::with_capacity(count);
     for i in 0..count {
         let slide = (i as f32 - (count as f32 - 1.0) / 2.0) * SPACING;
-        let pos = anchor + DVec3::new((right.x * slide) as f64, 0.0, (right.z * slide) as f64);
+        let pos = anchor + DVec3::new((right.x * slide + wander[i].x) as f64, 0.0, (right.z * slide + wander[i].z) as f64);
         let offset = (pos - camera).as_vec3();
         if visible(&world.view_proj, offset + Vec3::new(0.0, 1.0, 0.0), 1.6) {
             shown.push(i);
@@ -540,7 +661,8 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
     }
     // Animacao: refaz a pose so dos personagens que aparecem.
     for &i in &shown {
-        let bytes = build_vertices(&models[i], *yaw, t);
+        let wd = &wander[i];
+        let bytes = build_vertices(&models[i], wd.yaw, &Pose { t_idle: t, t_walk: wd.wt, w: wd.w });
         world.queue.write_buffer(&chars[i].vertices, 0, &bytes);
     }
 
