@@ -9,15 +9,17 @@ struct CharDef {
     texture: &'static [u8],
     anim_idle: &'static [u8],
     anim_walk: &'static [u8],
+    /// Animacoes extras do Polymod (run, gestos, ataque...), por nome.
+    extras: &'static [(&'static str, &'static [u8])],
 }
 
 /// Ordem na fila (esquerda -> direita): Jenny, Ellie, Bia, Allie, Slime.
 const CHARS: [CharDef; 5] = [
-    CharDef { model: include_bytes!("chars/jenny.bin"), texture: include_bytes!("chars/jenny.rgba"), anim_idle: include_bytes!("chars/jenny_idle.anim"), anim_walk: include_bytes!("chars/jenny_walk.anim") },
-    CharDef { model: include_bytes!("chars/ellie.bin"), texture: include_bytes!("chars/ellie.rgba"), anim_idle: include_bytes!("chars/ellie_idle.anim"), anim_walk: include_bytes!("chars/ellie_walk.anim") },
-    CharDef { model: include_bytes!("chars/bia.bin"), texture: include_bytes!("chars/bia.rgba"), anim_idle: include_bytes!("chars/bia_idle.anim"), anim_walk: include_bytes!("chars/bia_walk.anim") },
-    CharDef { model: include_bytes!("chars/allie.bin"), texture: include_bytes!("chars/allie.rgba"), anim_idle: include_bytes!("chars/allie_idle.anim"), anim_walk: include_bytes!("chars/allie_walk.anim") },
-    CharDef { model: include_bytes!("chars/slime.bin"), texture: include_bytes!("chars/slime.rgba"), anim_idle: include_bytes!("chars/slime_idle.anim"), anim_walk: include_bytes!("chars/slime_walk.anim") },
+    CharDef { model: include_bytes!("chars/jenny.bin"), texture: include_bytes!("chars/jenny.rgba"), anim_idle: include_bytes!("chars/jenny_idle.anim"), anim_walk: include_bytes!("chars/jenny_walk.anim"), extras: &[("run", include_bytes!("chars/jenny_run.anim")), ("wave", include_bytes!("chars/jenny_wave.anim")), ("wave_idle", include_bytes!("chars/jenny_wave_idle.anim")), ("atk0", include_bytes!("chars/jenny_atk0.anim")), ("atk1", include_bytes!("chars/jenny_atk1.anim")), ("atk2", include_bytes!("chars/jenny_atk2.anim")), ("sit", include_bytes!("chars/jenny_sit.anim")), ("dance", include_bytes!("chars/jenny_dance.anim"))] },
+    CharDef { model: include_bytes!("chars/ellie.bin"), texture: include_bytes!("chars/ellie.rgba"), anim_idle: include_bytes!("chars/ellie_idle.anim"), anim_walk: include_bytes!("chars/ellie_walk.anim"), extras: &[("run", include_bytes!("chars/ellie_run.anim")), ("atk0", include_bytes!("chars/ellie_atk0.anim")), ("atk1", include_bytes!("chars/ellie_atk1.anim")), ("atk2", include_bytes!("chars/ellie_atk2.anim")), ("sit", include_bytes!("chars/ellie_sit.anim")), ("crouchwalk", include_bytes!("chars/ellie_crouchwalk.anim")), ("dash", include_bytes!("chars/ellie_dash.anim"))] },
+    CharDef { model: include_bytes!("chars/bia.bin"), texture: include_bytes!("chars/bia.rgba"), anim_idle: include_bytes!("chars/bia_idle.anim"), anim_walk: include_bytes!("chars/bia_walk.anim"), extras: &[("run", include_bytes!("chars/bia_run.anim")), ("wave", include_bytes!("chars/bia_wave.anim")), ("wave_idle", include_bytes!("chars/bia_wave_idle.anim")), ("atk0", include_bytes!("chars/bia_atk0.anim")), ("atk1", include_bytes!("chars/bia_atk1.anim")), ("atk2", include_bytes!("chars/bia_atk2.anim")), ("sit", include_bytes!("chars/bia_sit.anim"))] },
+    CharDef { model: include_bytes!("chars/allie.bin"), texture: include_bytes!("chars/allie.rgba"), anim_idle: include_bytes!("chars/allie_idle.anim"), anim_walk: include_bytes!("chars/allie_walk.anim"), extras: &[("atk0", include_bytes!("chars/allie_atk0.anim")), ("atk1", include_bytes!("chars/allie_atk1.anim")), ("atk2", include_bytes!("chars/allie_atk2.anim")), ("tail", include_bytes!("chars/allie_tail.anim"))] },
+    CharDef { model: include_bytes!("chars/slime.bin"), texture: include_bytes!("chars/slime.rgba"), anim_idle: include_bytes!("chars/slime_idle.anim"), anim_walk: include_bytes!("chars/slime_walk.anim"), extras: &[("run", include_bytes!("chars/slime_run.anim")), ("atk0", include_bytes!("chars/slime_atk0.anim")), ("atk1", include_bytes!("chars/slime_atk1.anim")), ("atk2", include_bytes!("chars/slime_atk2.anim")), ("sit", include_bytes!("chars/slime_sit.anim")), ("jump", include_bytes!("chars/slime_jump.anim"))] },
 ];
 const TEX_SIZE: u32 = 1024;
 /// Distancia da camera e espaco entre personagens (em blocos).
@@ -26,6 +28,12 @@ const SPACING: f32 = 1.8;
 /// Passeio: raio (blocos) em volta do lugar de cada uma e velocidade (blocos/s).
 const WANDER_RADIUS: f32 = 1.4;
 const WALK_SPEED: f32 = 1.0;
+const RUN_SPEED: f32 = 2.4;
+/// Gestos sorteados quando a personagem esta parada (so os que o modelo tem).
+const EMOTES: [&str; 8] = ["wave", "atk0", "atk1", "atk2", "sit", "dance", "jump", "tail"];
+/// Gestos que ficam em loop (duram `LOOP_EMOTE_SECS`); os outros tocam uma vez.
+const LOOPED_EMOTES: [&str; 2] = ["sit", "tail"];
+const LOOP_EMOTE_SECS: f32 = 5.0;
 /// Bedrock gira com sinal oposto a regra da mao direita.
 const SIGN: f32 = -1.0;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
@@ -102,6 +110,7 @@ struct Anim {
 struct Model {
     idle: Option<Anim>,
     walk: Option<Anim>,
+    extras: Vec<(&'static str, Anim)>,
     bones: Vec<Bone>,
     /// pos(3) uv(2) normal(3) tint(3), em blocos, na pose de repouso.
     verts: Vec<[f32; 11]>,
@@ -115,6 +124,12 @@ fn rd_u32(b: &[u8], p: &mut usize) -> u32 {
 
 fn rd_f32(b: &[u8], p: &mut usize) -> f32 {
     f32::from_bits(rd_u32(b, p))
+}
+
+impl Model {
+    fn extra(&self, name: &str) -> Option<&Anim> {
+        self.extras.iter().find(|(n, _)| *n == name).map(|(_, a)| a)
+    }
 }
 
 fn parse_model(data: &[u8]) -> Model {
@@ -140,7 +155,7 @@ fn parse_model(data: &[u8]) -> Model {
         }
         verts.push(v);
     }
-    Model { idle: None, walk: None, bones, verts }
+    Model { idle: None, walk: None, extras: Vec::new(), bones, verts }
 }
 
 fn parse_anim(data: &[u8]) -> Option<Anim> {
@@ -173,8 +188,19 @@ fn parse_anim(data: &[u8]) -> Option<Anim> {
 struct Pose {
     t_idle: f32,
     t_walk: f32,
-    /// 0 = parada (idle), 1 = andando (walk).
+    /// 0 = parada (idle), 1 = andando.
     w: f32,
+    /// Quando andando: 0 = walk, 1 = run.
+    run: f32,
+    t_run: f32,
+    /// Gesto em cima da pose base: (nome, tempo, peso 0..1).
+    emote: Option<(&'static str, f32, f32)>,
+}
+
+impl Pose {
+    fn rest(t: f32) -> Pose {
+        Pose { t_idle: t, t_walk: 0.0, w: 0.0, run: 0.0, t_run: 0.0, emote: None }
+    }
 }
 
 fn add_pose(a: &Anim, t: f32, weight: f32, drot: &mut [Vec3], dpos: &mut [Vec3]) {
@@ -203,11 +229,28 @@ fn bone_matrices(model: &Model, pose: &Pose) -> Vec<Mat4> {
     let mut drot = vec![Vec3::ZERO; n];
     let mut dpos = vec![Vec3::ZERO; n];
     let w = if model.walk.is_some() { pose.w.clamp(0.0, 1.0) } else { 0.0 };
+    let run_a = model.extra("run");
+    let r = if run_a.is_some() { pose.run.clamp(0.0, 1.0) } else { 0.0 };
     if let Some(a) = &model.idle {
         add_pose(a, pose.t_idle, 1.0 - w, &mut drot, &mut dpos);
     }
     if let Some(a) = &model.walk {
-        add_pose(a, pose.t_walk, w, &mut drot, &mut dpos);
+        add_pose(a, pose.t_walk, w * (1.0 - r), &mut drot, &mut dpos);
+    }
+    if let Some(a) = run_a {
+        add_pose(a, pose.t_run, w * r, &mut drot, &mut dpos);
+    }
+    if let Some((name, t, e)) = pose.emote {
+        if let Some(a) = model.extra(name) {
+            let e = e.clamp(0.0, 1.0);
+            for i in 0..n {
+                drot[i] *= 1.0 - e;
+                dpos[i] *= 1.0 - e;
+            }
+            // Gesto de uma vez so: nao repete se passar do fim.
+            let t = if LOOPED_EMOTES.contains(&name) { t } else { t.min(a.frames as f32 / a.fps - 0.001) };
+            add_pose(a, t, e, &mut drot, &mut dpos);
+        }
     }
     let mut world: Vec<Mat4> = Vec::with_capacity(n);
     for (i, b) in model.bones.iter().enumerate() {
@@ -234,6 +277,13 @@ struct Wander {
     wait: f32,
     w: f32,
     wt: f32,
+    /// Corrida: peso (0..1), relogio e se o trajeto atual e corrido.
+    run: f32,
+    rt: f32,
+    running: bool,
+    /// Gesto atual: (nome, tempo, duracao) e peso da mistura.
+    emote: Option<(&'static str, f32, f32)>,
+    e: f32,
     rng: u32,
 }
 
@@ -249,6 +299,11 @@ impl Wander {
             wait: 1.0 + i as f32 * 0.7,
             w: 0.0,
             wt: 0.0,
+            run: 0.0,
+            rt: 0.0,
+            running: false,
+            emote: None,
+            e: 0.0,
             rng: 0x9E37_79B9u32.wrapping_mul(i as u32 + 1) | 1,
         }
     }
@@ -273,16 +328,36 @@ fn turn_toward(cur: f32, want: f32, max: f32) -> f32 {
     cur + d.clamp(-max, max)
 }
 
-fn step_wander(w: &mut Wander, dt: f32, home_yaw: f32) {
+fn step_wander(w: &mut Wander, dt: f32, home_yaw: f32, model: &Model) {
+    // Gesto em andamento: fica parada ate acabar, com entrada/saida suaves.
+    if let Some((name, t, dur)) = w.emote {
+        let t = t + dt;
+        if t >= dur {
+            w.emote = None;
+            w.wait = 2.0 + rnd(w) * 4.0;
+        } else {
+            w.emote = Some((name, t, dur));
+        }
+        let fade = 0.25;
+        let goal = if t < dur - fade { 1.0 } else { 0.0 };
+        w.e += (goal - w.e) * (dt / fade).min(1.0);
+        w.yaw = turn_toward(w.yaw, home_yaw, 3.0 * dt);
+        w.w += (0.0 - w.w) * (dt / 0.25).min(1.0);
+        return;
+    }
+    w.e += (0.0 - w.e) * (dt / 0.25).min(1.0);
+
     if w.walking {
         let dx = w.tx - w.x;
         let dz = w.tz - w.z;
         let d = (dx * dx + dz * dz).sqrt();
         if d < 0.08 {
             w.walking = false;
+            w.running = false;
             w.wait = 2.0 + rnd(w) * 5.0;
         } else {
-            let step = (WALK_SPEED * dt).min(d);
+            let speed = if w.running { RUN_SPEED } else { WALK_SPEED };
+            let step = (speed * dt).min(d);
             w.x += dx / d * step;
             w.z += dz / d * step;
             w.yaw = turn_toward(w.yaw, dx.atan2(dz), 6.0 * dt);
@@ -291,17 +366,43 @@ fn step_wander(w: &mut Wander, dt: f32, home_yaw: f32) {
         w.yaw = turn_toward(w.yaw, home_yaw, 3.0 * dt);
         w.wait -= dt;
         if w.wait <= 0.0 {
-            let a = rnd(w) * std::f32::consts::TAU;
-            let r = (0.5 + rnd(w) * 0.5) * WANDER_RADIUS;
-            w.tx = a.cos() * r;
-            w.tz = a.sin() * r;
-            w.walking = true;
+            let avail: Vec<&'static str> = EMOTES.iter().copied().filter(|n| model.extra(n).is_some()).collect();
+            if !avail.is_empty() && rnd(w) < 0.35 {
+                let name = avail[(rnd(w) * avail.len() as f32) as usize % avail.len()];
+                let len = model.extra(name).map(|a| a.frames as f32 / a.fps).unwrap_or(1.0);
+                let dur = if LOOPED_EMOTES.contains(&name) { LOOP_EMOTE_SECS } else { len };
+                w.emote = Some((name, 0.0, dur));
+            } else {
+                let a = rnd(w) * std::f32::consts::TAU;
+                let r = (0.5 + rnd(w) * 0.5) * WANDER_RADIUS;
+                w.tx = a.cos() * r;
+                w.tz = a.sin() * r;
+                w.walking = true;
+                w.running = model.extra("run").is_some() && rnd(w) < 0.25;
+            }
         }
     }
     let goal = if w.walking { 1.0 } else { 0.0 };
     w.w += (goal - w.w) * (dt / 0.25).min(1.0);
+    let rgoal = if w.running { 1.0 } else { 0.0 };
+    w.run += (rgoal - w.run) * (dt / 0.25).min(1.0);
     if w.w > 0.01 {
-        w.wt += dt;
+        if w.running {
+            w.rt += dt;
+        } else {
+            w.wt += dt;
+        }
+    }
+}
+
+fn pose_of(w: &Wander, t: f32) -> Pose {
+    Pose {
+        t_idle: t,
+        t_walk: w.wt,
+        w: w.w,
+        run: w.run,
+        t_run: w.rt,
+        emote: w.emote.map(|(n, et, _)| (n, et, w.e)),
     }
 }
 
@@ -572,6 +673,7 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
                 let mut m = parse_model(c.model);
                 m.idle = parse_anim(c.anim_idle);
                 m.walk = parse_anim(c.anim_walk);
+                m.extras = c.extras.iter().filter_map(|(n, d)| parse_anim(d).map(|a| (*n, a))).collect();
                 m
             })
             .collect(),
@@ -617,8 +719,8 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
     if too_far || state.wander.len() != CHARS.len() {
         state.wander = (0..CHARS.len()).map(|i| Wander::new(home_yaw, i)).collect();
     }
-    for w in state.wander.iter_mut() {
-        step_wander(w, dt, home_yaw);
+    for (i, w) in state.wander.iter_mut().enumerate() {
+        step_wander(w, dt, home_yaw, &state.models[i]);
     }
 
     let needs_gpu = match &state.shared {
@@ -638,7 +740,7 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
     };
     if rebuild {
         for (i, model) in models.iter().enumerate() {
-            let bytes = build_vertices(model, home_yaw, &Pose { t_idle: t, t_walk: 0.0, w: 0.0 });
+            let bytes = build_vertices(model, home_yaw, &Pose::rest(t));
             world.queue.write_buffer(&chars[i].vertices, 0, &bytes);
         }
     }
@@ -662,7 +764,7 @@ pub(super) fn draw(world: &mut WorldDrawn<'_>) {
     // Animacao: refaz a pose so dos personagens que aparecem.
     for &i in &shown {
         let wd = &wander[i];
-        let bytes = build_vertices(&models[i], wd.yaw, &Pose { t_idle: t, t_walk: wd.wt, w: wd.w });
+        let bytes = build_vertices(&models[i], wd.yaw, &pose_of(wd, t));
         world.queue.write_buffer(&chars[i].vertices, 0, &bytes);
     }
 
